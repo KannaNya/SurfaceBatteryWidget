@@ -11,7 +11,7 @@ import win32com.client
 import win32con
 import win32gui
 import winreg
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -20,10 +20,12 @@ START_CMD = BASE_DIR / "Start_SurfaceBatteryWidgetV10.cmd"
 APP_NAME = "SurfaceBatteryWidgetV10"
 MUTEX_NAME = "Global\\SurfaceBatteryWidgetV10"
 
-LOGICAL_WIDTH = 72
-LOGICAL_HEIGHT = 72
+LOGICAL_WIDTH = 98
+LOGICAL_HEIGHT = 30
 RIGHT_MARGIN = 6
-BOTTOM_MARGIN = 104
+BOTTOM_MARGIN = 4
+SHADOW_PAD = 4
+CARD_RADIUS = 4
 
 TIMER_ID = 1
 TIMER_MS = 1000
@@ -344,14 +346,8 @@ def format_eta(hours: float | None) -> str:
         return "--"
     minutes = round(hours * 60)
     if minutes >= 600:
-        return "10h+"
-    return f"{minutes}m"
-
-
-def eta_lines(eta: str) -> list[str]:
-    if eta.endswith("m") and eta[:-1].isdigit():
-        return [eta[:-1], "min"]
-    return [eta]
+        return "600+"
+    return str(minutes)
 
 
 FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
@@ -399,44 +395,64 @@ def centered_text(draw: ImageDraw.ImageDraw, width: int, y: int, text: str, font
     draw.text(((width - text_width(draw, text, font)) // 2, y), text, font=font, fill=fill)
 
 
-def render_widget_image(eta: str, watts: float | None, dpi: int = 96) -> Image.Image:
+def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.Image:
     scale = dpi / 96.0
     width = max(1, round(LOGICAL_WIDTH * scale))
     height = max(1, round(LOGICAL_HEIGHT * scale))
+    pad = max(1, round(SHADOW_PAD * scale))
+    card_w = width - pad * 2
+    card_h = height - pad * 2
+    radius = max(1, round(CARD_RADIUS * scale))
     ss = 4
 
-    def p(value: float) -> int:
-        return round(value * scale)
+    # Shadow layer (offset 1px down for natural light direction)
+    shadow = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    shadow_offset = max(1, round(scale * ss))
+    sr = (pad * ss, pad * ss + shadow_offset,
+          (pad + card_w) * ss - 1, (pad + card_h) * ss - 1 + shadow_offset)
+    sd.rounded_rectangle(sr, radius=radius * ss, fill=(0, 0, 0, 40))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(1, round(2.5 * scale * ss))))
 
-    def ps(value: float) -> int:
-        return round(value * scale * ss)
+    # Card layer: Mica warm gray
+    card = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(card)
+    cr = (pad * ss, pad * ss, (pad + card_w) * ss - 1, (pad + card_h) * ss - 1)
+    cd.rounded_rectangle(cr, radius=radius * ss, fill=(44, 44, 44, 210))
+    cd.rounded_rectangle(cr, radius=radius * ss,
+                         outline=(255, 255, 255, 20), width=max(1, round(scale * ss)))
 
-    bg = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(bg)
-    bd.rounded_rectangle(
-        (ps(0), ps(0), ps(LOGICAL_WIDTH - 1), ps(LOGICAL_HEIGHT - 3)),
-        radius=ps(15),
-        fill="#20252b",
-        outline=(255, 255, 255, 24),
-        width=max(1, ps(1)),
-    )
-    img = bg.resize((width, height), Image.Resampling.LANCZOS)
+    # Composite shadow + card
+    img = Image.alpha_composite(shadow, card)
 
+    # Draw text at 4x supersampled resolution for crisp rendering
     draw = ImageDraw.Draw(img)
-    lines = eta_lines(eta)
-    if len(lines) == 2 and lines[1] == "min":
-        eta_text = f"{lines[0]} min"
-        eta_font = fit_font(draw, eta_text, "seguisb.ttf", p(16), p(12), p(60))
-        centered_text(draw, width, p(18), eta_text, eta_font, "#f7fbff")
-    else:
-        eta_font = fit_font(draw, eta, "seguisb.ttf", p(17), p(10), p(54))
-        centered_text(draw, width, p(18), eta, eta_font, "#f7fbff")
+    display_eta = f"{eta_text} min" if eta_text not in ("AC", "--") else eta_text
+    sep = " \u00b7 "
+    full = f"{display_eta}{sep}{watts_text}"
 
-    draw.line((p(22), p(46), p(LOGICAL_WIDTH - 22), p(46)), fill=(255, 255, 255, 96), width=max(1, p(1)))
+    font = fit_font(draw, full, "seguisb.ttf",
+                    round(10 * scale * ss), round(7 * scale * ss),
+                    card_w * ss - round(6 * scale * ss))
 
-    power_text = "--" if watts is None else f"{watts:.1f}W"
-    power_font = fit_font(draw, power_text, "seguisb.ttf", p(10), p(8), p(52))
-    centered_text(draw, width, p(51), power_text, power_font, "#f1f4f7")
+    eta_w = text_width(draw, display_eta, font)
+    sep_w = text_width(draw, sep, font)
+    watts_w = text_width(draw, watts_text, font)
+    total_w = eta_w + sep_w + watts_w
+    tx = pad * ss + (card_w * ss - total_w) // 2
+
+    bbox = draw.textbbox((0, 0), full, font=font)
+    text_h = bbox[3] - bbox[1]
+    ty = pad * ss + (card_h * ss - text_h) // 2 - bbox[1]
+
+    text_color = "#f0f6fc"
+    draw.text((tx, ty), display_eta, font=font, fill=text_color)
+    draw.text((tx + eta_w, ty), sep, font=font, fill=text_color)
+    draw.text((tx + eta_w + sep_w, ty), watts_text, font=font, fill=text_color)
+
+    # Downsample everything together
+    img = img.resize((width, height), Image.Resampling.LANCZOS)
+
     return img
 
 
@@ -585,7 +601,8 @@ class SurfaceBatteryWidget:
             log(f"Tick {self.tick}: eta={eta}, watts={watts_text}")
 
     def render(self) -> None:
-        image = render_widget_image(self.last_eta, self.last_watts, self.dpi)
+        watts_text = "--" if self.last_watts is None else f"{self.last_watts:.1f}W"
+        image = render_widget_image(self.last_eta, watts_text, self.dpi)
         self.width, self.height = image.size
         self.update_layered_window(image)
 
