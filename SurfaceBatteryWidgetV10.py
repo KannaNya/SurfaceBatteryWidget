@@ -30,6 +30,7 @@ CARD_RADIUS = 4
 TIMER_ID = 1
 TIMER_MS = 1000
 WM_APP_UPDATE = win32con.WM_APP + 10
+WM_DPICHANGED = 0x02E0
 
 MENU_TOGGLE_STARTUP = 1001
 MENU_TOGGLE_DRAG = 1002
@@ -864,7 +865,7 @@ class SurfaceBatteryWidget:
                 win32gui.ReleaseCapture()
                 win32gui.SendMessage(hwnd, win32con.WM_NCLBUTTONDOWN, win32con.HTCAPTION, 0)
             return 0
-        if msg == win32con.WM_DPICHANGED:
+        if msg == WM_DPICHANGED:
             self.refresh_dpi()
             self.lock_position()
             self.render()
