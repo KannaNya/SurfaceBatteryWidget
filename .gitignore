@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.log
+*.html
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Local/private context
+codex_memory.md
+battery-report.html
+.venv/
+venv/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Historical prototypes kept locally; V10 is the handoff baseline.
+SurfaceBatteryTray.ps1
+SurfaceBatteryWidget.ps1
+SurfaceBatteryWidgetV[2-7].*
+SurfacePowerMonitor.ps1
+Start_SurfaceBatteryTray.cmd
+Start_SurfaceBatteryWidget.cmd
+Start_SurfaceBatteryWidgetV[2-7].cmd
+Start_SurfacePowerMonitor.cmd
