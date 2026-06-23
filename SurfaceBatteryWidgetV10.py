@@ -414,41 +414,168 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
     sd.rounded_rectangle(sr, radius=radius * ss, fill=(0, 0, 0, 40))
     shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(1, round(2.5 * scale * ss))))
 
-    # Card layer: Mica warm gray
+    # Card layer: Mica warm gray with vertical gradient
     card = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
+    
+    # Create gradient fill image for the card area
+    gradient = Image.new("RGBA", (1, card_h * ss))
+    for y in range(card_h * ss):
+        # Subtle top-to-bottom light-to-dark vertical gradient:
+        # Top: (48, 48, 48, 220), Bottom: (36, 36, 36, 200)
+        factor = y / max(1, card_h * ss - 1)
+        r = int(48 - factor * 12)
+        g = int(48 - factor * 12)
+        b = int(48 - factor * 12)
+        a = int(220 - factor * 20)
+        gradient.putpixel((0, y), (r, g, b, a))
+    gradient = gradient.resize((card_w * ss, card_h * ss), Image.Resampling.BILINEAR)
+
+    # Rounded rectangle mask for the card shape
+    mask = Image.new("L", (card_w * ss, card_h * ss), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle((0, 0, card_w * ss - 1, card_h * ss - 1), radius=radius * ss, fill=255)
+
+    # Paste gradient onto card
+    card.paste(gradient, (pad * ss, pad * ss), mask)
+
+    # Draw border and 3D highlights
     cd = ImageDraw.Draw(card)
     cr = (pad * ss, pad * ss, (pad + card_w) * ss - 1, (pad + card_h) * ss - 1)
-    cd.rounded_rectangle(cr, radius=radius * ss, fill=(44, 44, 44, 210))
+    
+    # Subtle all-around thin border
     cd.rounded_rectangle(cr, radius=radius * ss,
-                         outline=(255, 255, 255, 20), width=max(1, round(scale * ss)))
+                         outline=(255, 255, 255, 12), width=max(1, round(scale * ss)))
+                         
+    # Top highlight line inside the rounded rect flat top part
+    line_w = max(1, round(scale * ss))
+    cd.line((pad * ss + radius * ss, pad * ss, (pad + card_w) * ss - radius * ss, pad * ss),
+            fill=(255, 255, 255, 45), width=line_w)
+            
+    # Bottom shadow line
+    cd.line((pad * ss + radius * ss, (pad + card_h) * ss - 1, (pad + card_w) * ss - radius * ss, (pad + card_h) * ss - 1),
+            fill=(0, 0, 0, 45), width=line_w)
 
     # Composite shadow + card
     img = Image.alpha_composite(shadow, card)
 
     # Draw text at 4x supersampled resolution for crisp rendering
     draw = ImageDraw.Draw(img)
-    display_eta = f"{eta_text} min" if eta_text not in ("AC", "--") else eta_text
-    sep = " \u00b7 "
-    full = f"{display_eta}{sep}{watts_text}"
+    
+    # Define font sizes
+    val_size = round(10.5 * scale * ss)
+    unit_size = round(8.5 * scale * ss)
+    max_width = card_w * ss - round(6 * scale * ss)
 
-    font = fit_font(draw, full, "seguisb.ttf",
-                    round(10 * scale * ss), round(7 * scale * ss),
-                    card_w * ss - round(6 * scale * ss))
+    # Scale down sizes if text runs too wide (adaptive fitting)
+    for size_reduce in range(0, 5):
+        font_val = load_font("seguisb.ttf", val_size - size_reduce * ss)
+        font_unit = load_font("segoeui.ttf", unit_size - size_reduce * ss)
+        
+        segments = []
+        
+        # 1. ETA / AC Segment
+        if eta_text == "AC":
+            # Icon dimensions
+            icon_w = round(6 * scale * ss)
+            icon_h = round(10 * scale * ss)
+            
+            def make_draw_lightning(w, h):
+                return lambda d, x, y: d.polygon([
+                    (x + w * 0.65, y),
+                    (x + w * 0.15, y + h * 0.55),
+                    (x + w * 0.55, y + h * 0.55),
+                    (x + w * 0.35, y + h),
+                    (x + w * 0.85, y + h * 0.45),
+                    (x + w * 0.45, y + h * 0.45)
+                ], fill=(96, 205, 255, 255))  # Fluent Cyan/Blue
+                
+            segments.append({
+                "type": "icon",
+                "width": icon_w + round(3 * scale * ss),
+                "height": icon_h,
+                "draw_fn": make_draw_lightning(icon_w, icon_h)
+            })
+            segments.append({
+                "type": "text",
+                "text": "AC",
+                "font": font_val,
+                "color": "#f0f6fc"
+            })
+        elif eta_text == "--":
+            segments.append({
+                "type": "text",
+                "text": "--",
+                "font": font_val,
+                "color": "#c9d1d9"
+            })
+        else:
+            segments.append({
+                "type": "text",
+                "text": eta_text,
+                "font": font_val,
+                "color": "#f0f6fc"
+            })
+            segments.append({
+                "type": "text",
+                "text": " min",
+                "font": font_unit,
+                "color": "#8b949e"
+            })
+            
+        # 2. Separator
+        segments.append({
+            "type": "text",
+            "text": "  \u00b7  ",
+            "font": font_unit,
+            "color": "#8b949e"
+        })
+        
+        # 3. Wattage Segment
+        if watts_text == "--":
+            segments.append({
+                "type": "text",
+                "text": "--",
+                "font": font_val,
+                "color": "#c9d1d9"
+            })
+        else:
+            val = watts_text[:-1] if watts_text.endswith("W") else watts_text
+            segments.append({
+                "type": "text",
+                "text": val,
+                "font": font_val,
+                "color": "#f0f6fc"
+            })
+            segments.append({
+                "type": "text",
+                "text": "W",
+                "font": font_unit,
+                "color": "#8b949e"
+            })
+            
+        # Calculate width of all segments
+        total_w = 0
+        for seg in segments:
+            if seg["type"] == "text":
+                box = draw.textbbox((0, 0), seg["text"], font=seg["font"])
+                seg["width"] = box[2] - box[0]
+                seg["box_top_offset"] = box[1]
+                seg["box_height"] = box[3] - box[1]
+            total_w += seg["width"]
+            
+        if total_w <= max_width or size_reduce == 4:
+            break
 
-    eta_w = text_width(draw, display_eta, font)
-    sep_w = text_width(draw, sep, font)
-    watts_w = text_width(draw, watts_text, font)
-    total_w = eta_w + sep_w + watts_w
+    # Draw segments aligned to center
     tx = pad * ss + (card_w * ss - total_w) // 2
-
-    bbox = draw.textbbox((0, 0), full, font=font)
-    text_h = bbox[3] - bbox[1]
-    ty = pad * ss + (card_h * ss - text_h) // 2 - bbox[1]
-
-    text_color = "#f0f6fc"
-    draw.text((tx, ty), display_eta, font=font, fill=text_color)
-    draw.text((tx + eta_w, ty), sep, font=font, fill=text_color)
-    draw.text((tx + eta_w + sep_w, ty), watts_text, font=font, fill=text_color)
+    for seg in segments:
+        if seg["type"] == "text":
+            ty = pad * ss + (card_h * ss - seg["box_height"]) // 2 - seg["box_top_offset"]
+            draw.text((tx, ty), seg["text"], font=seg["font"], fill=seg["color"])
+        elif seg["type"] == "icon":
+            iy = pad * ss + (card_h * ss - seg["height"]) // 2
+            seg["draw_fn"](draw, tx, iy)
+        tx += seg["width"]
 
     # Downsample everything together
     img = img.resize((width, height), Image.Resampling.LANCZOS)
