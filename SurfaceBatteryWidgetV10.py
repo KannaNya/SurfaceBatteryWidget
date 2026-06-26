@@ -415,19 +415,19 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
     sd.rounded_rectangle(sr, radius=radius * ss, fill=(0, 0, 0, 40))
     shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(1, round(2.5 * scale * ss))))
 
-    # Card layer: Mica warm gray with vertical gradient
+    # Card layer: Mica dark gray theme with vertical gradient
     card = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
     
-    # Create gradient fill image for the card area
+    # Create gradient fill image for the card area (Mica dark gray theme)
     gradient = Image.new("RGBA", (1, card_h * ss))
     for y in range(card_h * ss):
-        # Subtle top-to-bottom light-to-dark vertical gradient:
-        # Top: (48, 48, 48, 220), Bottom: (36, 36, 36, 200)
+        # Subtle top-to-bottom dark theme gradient:
+        # Top: (32, 32, 32, 225), Bottom: (24, 24, 24, 215)
         factor = y / max(1, card_h * ss - 1)
-        r = int(48 - factor * 12)
-        g = int(48 - factor * 12)
-        b = int(48 - factor * 12)
-        a = int(220 - factor * 20)
+        r = int(32 - factor * 8)
+        g = int(32 - factor * 8)
+        b = int(32 - factor * 8)
+        a = int(225 - factor * 10)
         gradient.putpixel((0, y), (r, g, b, a))
     gradient = gradient.resize((card_w * ss, card_h * ss), Image.Resampling.BILINEAR)
 
@@ -443,18 +443,18 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
     cd = ImageDraw.Draw(card)
     cr = (pad * ss, pad * ss, (pad + card_w) * ss - 1, (pad + card_h) * ss - 1)
     
-    # Subtle all-around thin border
+    # Subtle all-around thin border (Mica style)
     cd.rounded_rectangle(cr, radius=radius * ss,
-                         outline=(255, 255, 255, 12), width=max(1, round(scale * ss)))
+                         outline=(255, 255, 255, 10), width=max(1, round(scale * ss)))
                          
     # Top highlight line inside the rounded rect flat top part
     line_w = max(1, round(scale * ss))
     cd.line((pad * ss + radius * ss, pad * ss, (pad + card_w) * ss - radius * ss, pad * ss),
-            fill=(255, 255, 255, 45), width=line_w)
+            fill=(255, 255, 255, 30), width=line_w)
             
     # Bottom shadow line
     cd.line((pad * ss + radius * ss, (pad + card_h) * ss - 1, (pad + card_w) * ss - radius * ss, (pad + card_h) * ss - 1),
-            fill=(0, 0, 0, 45), width=line_w)
+            fill=(0, 0, 0, 30), width=line_w)
 
     # Composite shadow + card
     img = Image.alpha_composite(shadow, card)
@@ -462,9 +462,34 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
     # Draw text at 4x supersampled resolution for crisp rendering
     draw = ImageDraw.Draw(img)
     
-    # Define font sizes
-    val_size = round(10.5 * scale * ss)
-    unit_size = round(8.5 * scale * ss)
+    # Parse remaining minutes for status coloring
+    minutes = None
+    if eta_text not in ("AC", "--"):
+        try:
+            if eta_text.endswith("+"):
+                minutes = int(eta_text[:-1])
+            else:
+                minutes = int(eta_text)
+        except ValueError:
+            pass
+
+    # Status color logic (strictly for state, no decoration)
+    # Low (<20 min) -> Red, Warning (<45 min) -> Orange, Normal -> White
+    if eta_text == "AC":
+        status_color = "#f0f6fc"  # Standard white
+    elif minutes is not None:
+        if minutes < 20:
+            status_color = "#ff6b72"  # Fluent Soft Red
+        elif minutes < 45:
+            status_color = "#ff9d5c"  # Fluent Soft Orange
+        else:
+            status_color = "#f0f6fc"  # Normal White
+    else:
+        status_color = "#8b949e"  # Normal Gray
+
+    # Define font sizes (restrained sizes for clean integration)
+    val_size = round(9.5 * scale * ss)
+    unit_size = round(8.0 * scale * ss)
     max_width = card_w * ss - round(6 * scale * ss)
 
     # Scale down sizes if text runs too wide (adaptive fitting)
@@ -488,7 +513,7 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
                     (x + w * 0.35, y + h),
                     (x + w * 0.85, y + h * 0.45),
                     (x + w * 0.45, y + h * 0.45)
-                ], fill=(96, 205, 255, 255))  # Fluent Cyan/Blue
+                ], fill=(240, 246, 252, 255))  # Clean white/gray lightning
                 
             segments.append({
                 "type": "icon",
@@ -507,14 +532,14 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
                 "type": "text",
                 "text": "--",
                 "font": font_val,
-                "color": "#c9d1d9"
+                "color": "#8b949e"
             })
         else:
             segments.append({
                 "type": "text",
                 "text": eta_text,
                 "font": font_val,
-                "color": "#f0f6fc"
+                "color": status_color
             })
             segments.append({
                 "type": "text",
@@ -537,7 +562,7 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
                 "type": "text",
                 "text": "--",
                 "font": font_val,
-                "color": "#c9d1d9"
+                "color": "#8b949e"
             })
         else:
             val = watts_text[:-1] if watts_text.endswith("W") else watts_text
