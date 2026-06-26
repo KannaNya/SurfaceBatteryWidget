@@ -20,9 +20,9 @@ START_CMD = BASE_DIR / "Start_SurfaceBatteryWidgetV10.cmd"
 APP_NAME = "SurfaceBatteryWidgetV10"
 MUTEX_NAME = "Global\\SurfaceBatteryWidgetV10"
 
-LOGICAL_WIDTH = 98
-LOGICAL_HEIGHT = 30
-RIGHT_MARGIN = 6
+LOGICAL_WIDTH = 124
+LOGICAL_HEIGHT = 34
+RIGHT_MARGIN = 138
 BOTTOM_MARGIN = 4
 SHADOW_PAD = 4
 CARD_RADIUS = 4
@@ -225,18 +225,33 @@ class BatteryReader:
     def __init__(self) -> None:
         self.wmi_default = win32com.client.GetObject("winmgmts:")
         self.wmi_battery = win32com.client.GetObject(r"winmgmts:\\.\root\wmi")
-        self.snapshot = {"percent": None, "remaining_wh": None, "online": False}
+        self.snapshot = {
+            "percent": None,
+            "remaining_wh": None,
+            "online": False,
+            "charging": False,
+            "charge_rate_w": None,
+            "full_charge_wh": None,
+        }
 
     def refresh(self) -> dict:
         try:
             battery = list(self.wmi_default.InstancesOf("Win32_Battery"))
             statuses = list(self.wmi_battery.InstancesOf("BatteryStatus"))
+            full = list(self.wmi_battery.InstancesOf("BatteryFullChargedCapacity"))
             b = battery[0] if battery else None
             s = statuses[0] if statuses else None
+            full_capacity = full[0] if full else None
+            charge_rate = float(s.ChargeRate) / 1000.0 if s is not None and int(s.ChargeRate) > 0 else None
             self.snapshot = {
                 "percent": int(b.EstimatedChargeRemaining) if b is not None else None,
                 "remaining_wh": float(s.RemainingCapacity) / 1000.0 if s is not None else None,
                 "online": bool(s.PowerOnline) if s is not None else False,
+                "charging": bool(s.Charging) if s is not None else False,
+                "charge_rate_w": charge_rate,
+                "full_charge_wh": (
+                    float(full_capacity.FullChargedCapacity) / 1000.0 if full_capacity is not None else None
+                ),
             }
         except Exception as exc:
             log(f"WMI battery read failed: {exc}")
@@ -349,6 +364,15 @@ def format_eta(hours: float | None) -> str:
     if minutes >= 600:
         return "600+"
     return str(minutes)
+
+
+def format_charge_eta(remaining_wh: float | None, full_charge_wh: float | None, charge_rate_w: float | None) -> str:
+    if not remaining_wh or not full_charge_wh or not charge_rate_w or charge_rate_w <= 0:
+        return "AC"
+    needed_wh = max(0.0, full_charge_wh - remaining_wh)
+    if needed_wh <= 0.15:
+        return "FULL"
+    return format_eta(needed_wh / charge_rate_w)
 
 
 FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
@@ -487,9 +511,9 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
     else:
         status_color = "#8b949e"  # Normal Gray
 
-    # Define font sizes (restrained sizes for clean integration)
-    val_size = round(9.5 * scale * ss)
-    unit_size = round(8.0 * scale * ss)
+    # Match the visual weight of Win11 taskbar status text more closely.
+    val_size = round(12.0 * scale * ss)
+    unit_size = round(10.0 * scale * ss)
     max_width = card_w * ss - round(6 * scale * ss)
 
     # Scale down sizes if text runs too wide (adaptive fitting)
@@ -527,10 +551,10 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
                 "font": font_val,
                 "color": "#f0f6fc"
             })
-        elif eta_text == "--":
+        elif eta_text in ("--", "FULL"):
             segments.append({
                 "type": "text",
-                "text": "--",
+                "text": eta_text,
                 "font": font_val,
                 "color": "#8b949e"
             })
@@ -741,7 +765,13 @@ class SurfaceBatteryWidget:
         watts = mw / 1000.0 if mw else None
         remaining = snap.get("remaining_wh")
         if snap.get("online"):
-            eta = "AC"
+            eta = format_charge_eta(
+                snap.get("remaining_wh"),
+                snap.get("full_charge_wh"),
+                snap.get("charge_rate_w"),
+            )
+            if snap.get("charging") and snap.get("charge_rate_w"):
+                watts = snap.get("charge_rate_w")
         elif watts and remaining:
             eta = format_eta(remaining / watts)
         else:
