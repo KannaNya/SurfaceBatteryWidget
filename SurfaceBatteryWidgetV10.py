@@ -20,11 +20,11 @@ START_CMD = BASE_DIR / "Start_SurfaceBatteryWidgetV10.cmd"
 APP_NAME = "SurfaceBatteryWidgetV10"
 MUTEX_NAME = "Global\\SurfaceBatteryWidgetV10"
 
-LOGICAL_WIDTH = 124
-LOGICAL_HEIGHT = 34
-RIGHT_MARGIN = 138
-BOTTOM_MARGIN = 4
-SHADOW_PAD = 4
+LOGICAL_WIDTH = 82
+LOGICAL_HEIGHT = 30
+RIGHT_MARGIN = 78
+SHADOW_PAD = 1
+BOTTOM_MARGIN = -2
 CARD_RADIUS = 4
 
 TIMER_ID = 1
@@ -420,7 +420,7 @@ def centered_text(draw: ImageDraw.ImageDraw, width: int, y: int, text: str, font
     draw.text(((width - text_width(draw, text, font)) // 2, y), text, font=font, fill=fill)
 
 
-def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.Image:
+def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96, charging: bool = False) -> Image.Image:
     scale = dpi / 96.0
     width = max(1, round(LOGICAL_WIDTH * scale))
     height = max(1, round(LOGICAL_HEIGHT * scale))
@@ -497,9 +497,9 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
         except ValueError:
             pass
 
-    # Status color logic (strictly for state, no decoration)
-    # Low (<20 min) -> Red, Warning (<45 min) -> Orange, Normal -> White
-    if eta_text == "AC":
+    # Status color logic. Charging ETA is positive information, so warning
+    # colors only apply while the battery is discharging.
+    if charging or eta_text == "AC":
         status_color = "#f0f6fc"  # Standard white
     elif minutes is not None:
         if minutes < 20:
@@ -511,10 +511,10 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
     else:
         status_color = "#8b949e"  # Normal Gray
 
-    # Match the visual weight of Win11 taskbar status text more closely.
-    val_size = round(12.0 * scale * ss)
-    unit_size = round(10.0 * scale * ss)
-    max_width = card_w * ss - round(6 * scale * ss)
+    # Match the visual weight of Win11 taskbar status text, with tighter labels.
+    val_size = round(11.5 * scale * ss)
+    unit_size = round(11.5 * scale * ss)
+    max_width = card_w * ss - round(1 * scale * ss)
 
     # Scale down sizes if text runs too wide (adaptive fitting)
     for size_reduce in range(0, 5):
@@ -567,7 +567,7 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
             })
             segments.append({
                 "type": "text",
-                "text": " min",
+                "text": "m",
                 "font": font_unit,
                 "color": "#8b949e"
             })
@@ -575,7 +575,7 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96) -> Image.
         # 2. Separator
         segments.append({
             "type": "text",
-            "text": "  \u00b7  ",
+            "text": " ",
             "font": font_unit,
             "color": "#8b949e"
         })
@@ -664,6 +664,7 @@ class SurfaceBatteryWidget:
         self.hwnd = None
         self.last_eta = "--"
         self.last_watts = None
+        self.last_charging = False
         self.running = False
         self.last_menu_time = 0.0
         self._register_window()
@@ -764,7 +765,9 @@ class SurfaceBatteryWidget:
         mw = self.power.read_mw()
         watts = mw / 1000.0 if mw else None
         remaining = snap.get("remaining_wh")
+        charging = False
         if snap.get("online"):
+            charging = True
             eta = format_charge_eta(
                 snap.get("remaining_wh"),
                 snap.get("full_charge_wh"),
@@ -778,6 +781,7 @@ class SurfaceBatteryWidget:
             eta = "--"
         self.last_eta = eta
         self.last_watts = watts
+        self.last_charging = charging
         self.render()
         if self.tick <= 5 or self.tick % 30 == 0:
             watts_text = "--" if watts is None else f"{watts:.1f}W"
@@ -785,7 +789,7 @@ class SurfaceBatteryWidget:
 
     def render(self) -> None:
         watts_text = "--" if self.last_watts is None else f"{self.last_watts:.1f}W"
-        image = render_widget_image(self.last_eta, watts_text, self.dpi)
+        image = render_widget_image(self.last_eta, watts_text, self.dpi, self.last_charging)
         self.width, self.height = image.size
         self.update_layered_window(image)
 
