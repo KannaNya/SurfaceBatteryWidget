@@ -934,6 +934,9 @@ class SurfaceBatteryWidget:
             self.lock_position()
             self.render()
             return 0
+        if msg == win32con.WM_SETTINGCHANGE:
+            self.lock_position()
+            return 0
         if msg == win32con.WM_DESTROY:
             self.close()
             win32gui.PostQuitMessage(0)
