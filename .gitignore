@@ -6,10 +6,12 @@ __pycache__/
 *.jpg
 *.jpeg
 *.webp
+power-diary/
 
 # Local/private context
 codex_memory.md
 battery-report.html
+*_lecture_notes_*.md
 .venv/
 venv/
 

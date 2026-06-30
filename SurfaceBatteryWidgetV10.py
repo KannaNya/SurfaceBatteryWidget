@@ -1,8 +1,10 @@
 import ctypes
+import csv
 import os
 import sys
 import threading
 import time
+from collections import defaultdict
 from ctypes import wintypes
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_PATH = BASE_DIR / "SurfaceBatteryWidgetV10.log"
+DIARY_DIR = BASE_DIR / "power-diary"
 START_CMD = BASE_DIR / "Start_SurfaceBatteryWidgetV10.cmd"
 APP_NAME = "SurfaceBatteryWidgetV10"
 MUTEX_NAME = "Global\\SurfaceBatteryWidgetV10"
@@ -31,11 +34,24 @@ TIMER_ID = 1
 TIMER_MS = 1000
 WM_APP_UPDATE = win32con.WM_APP + 10
 WM_DPICHANGED = 0x02E0
+WM_POWERBROADCAST = 0x0218
+WM_SETTINGCHANGE = 0x001A
+PBT_APMRESUMEAUTOMATIC = 0x0012
+PBT_APMRESUMESUSPEND = 0x0007
+PBT_POWERSETTINGCHANGE = 0x8013
+RESUME_RELOCK_SECONDS = 8.0
+POWER_DIARY_INTERVAL = 10.0
+POWER_DIARY_SUMMARY_INTERVAL = 60.0
+POWER_DIARY_TOP_N = 12
+MAX_REASONABLE_BATTERY_WATTS = 180.0
 
 MENU_TOGGLE_STARTUP = 1001
 MENU_TOGGLE_DRAG = 1002
 MENU_RELOCK = 1003
 MENU_EXIT = 1004
+MENU_OPEN_DIARY_SUMMARY = 1005
+MENU_OPEN_DIARY_FOLDER = 1006
+MENU_RUN_SCREEN_OFF_TEST = 1007
 
 ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
@@ -221,6 +237,16 @@ class PdhPowerMeter:
         self.ready = False
 
 
+def valid_battery_watts(value) -> float | None:
+    try:
+        watts = float(value) / 1000.0
+    except Exception:
+        return None
+    if 0 < watts <= MAX_REASONABLE_BATTERY_WATTS:
+        return watts
+    return None
+
+
 class BatteryReader:
     def __init__(self) -> None:
         self.wmi_default = win32com.client.GetObject("winmgmts:")
@@ -242,7 +268,7 @@ class BatteryReader:
             b = battery[0] if battery else None
             s = statuses[0] if statuses else None
             full_capacity = full[0] if full else None
-            charge_rate = float(s.ChargeRate) / 1000.0 if s is not None and int(s.ChargeRate) > 0 else None
+            charge_rate = valid_battery_watts(s.ChargeRate) if s is not None else None
             self.snapshot = {
                 "percent": int(b.EstimatedChargeRemaining) if b is not None else None,
                 "remaining_wh": float(s.RemainingCapacity) / 1000.0 if s is not None else None,
@@ -648,6 +674,231 @@ def premultiply_bgra(image: Image.Image) -> bytes:
     return bytes(out)
 
 
+def process_base_name(name: str) -> str:
+    return name.split("#", 1)[0].strip() or name
+
+
+def open_path(path: Path) -> None:
+    try:
+        if not path.exists():
+            if path.suffix:
+                path.parent.mkdir(exist_ok=True)
+                path.write_text("No data yet. Keep the widget running for a minute.\n", encoding="utf-8")
+            else:
+                path.mkdir(exist_ok=True)
+        os.startfile(str(path))
+    except Exception as exc:
+        log(f"Open path failed: {path}: {exc}")
+
+
+def power_saving_recommendations(top_names: list[str]) -> list[str]:
+    names = {name.lower() for name in top_names}
+    tips = []
+    if "chrome" in names or "msedge" in names:
+        tips.append("Browser is active: close video/chat tabs, enable sleeping tabs, or use fewer tabs in class.")
+    if "voicerecorder" in names or "audiodg" in names:
+        tips.append("Audio stack is active: stop recording/playback when you do not need it.")
+    if "msmpeng" in names:
+        tips.append("Defender is active: avoid large downloads/unzips on battery; let scans finish while plugged in.")
+    if "dwm" in names:
+        tips.append("Desktop compositor is active: lower brightness, avoid full-screen animations, and use 60 Hz in class mode.")
+    if "codex" in names:
+        tips.append("Codex is active: pause heavy agent work when you need maximum battery life.")
+    if "telegram" in names:
+        tips.append("Messaging apps are active: mute/quit background messengers during lectures.")
+    if not tips:
+        tips.append("No clear app culprit yet; collect at least 30 minutes of samples during a real class session.")
+    return tips
+
+
+class PowerDiary:
+    def __init__(self) -> None:
+        self.ready = False
+        self.wmi_perf = None
+        self.own_pid = os.getpid()
+        self.cpu_count = max(1, os.cpu_count() or 1)
+        self.last_sample_time = 0.0
+        self.last_summary_time = 0.0
+        self.started_at = time.time()
+        self.last_raw: dict[tuple[int, str], tuple[int, int, str]] = {}
+        self.process_score = defaultdict(float)
+        self.process_peak = defaultdict(float)
+        self.power_seconds = 0.0
+        self.power_sample_seconds = 0.0
+        self.sample_count = 0
+        self.power_path = DIARY_DIR / "power_samples.csv"
+        self.process_path = DIARY_DIR / "process_activity.csv"
+        self.summary_path = DIARY_DIR / "summary.txt"
+        try:
+            DIARY_DIR.mkdir(exist_ok=True)
+            self.wmi_perf = win32com.client.GetObject("winmgmts:")
+            self.ready = True
+            log("Power diary initialized")
+        except Exception as exc:
+            log(f"Power diary initialization failed: {exc}")
+
+    def append_csv(self, path: Path, header: list[str], row: list) -> None:
+        try:
+            needs_header = not path.exists()
+            with path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if needs_header:
+                    writer.writerow(header)
+                writer.writerow(row)
+        except Exception as exc:
+            log(f"Power diary write failed: {exc}")
+
+    def read_process_cpu(self, elapsed: float | None) -> list[dict]:
+        if not self.ready or self.wmi_perf is None:
+            return []
+        try:
+            rows = self.wmi_perf.ExecQuery(
+                "SELECT IDProcess,Name,PercentProcessorTime,TimeStamp_Sys100NS "
+                "FROM Win32_PerfRawData_PerfProc_Process"
+            )
+        except Exception as exc:
+            log(f"Power diary process query failed: {exc}")
+            return []
+
+        current: dict[tuple[int, str], tuple[int, int, str]] = {}
+        activity = []
+        for row in rows:
+            try:
+                pid = int(row.IDProcess)
+                instance_name = str(row.Name)
+                if pid == 0 or pid == self.own_pid or instance_name in ("Idle", "_Total"):
+                    continue
+                base_name = process_base_name(instance_name)
+                raw = int(row.PercentProcessorTime)
+                timestamp = int(row.TimeStamp_Sys100NS)
+            except Exception:
+                continue
+
+            key = (pid, instance_name)
+            current[key] = (raw, timestamp, base_name)
+            previous = self.last_raw.get(key)
+            if not previous:
+                continue
+            prev_raw, prev_timestamp, _ = previous
+            delta_raw = raw - prev_raw
+            delta_timestamp = timestamp - prev_timestamp
+            if delta_raw < 0 or delta_timestamp <= 0:
+                continue
+
+            cpu_percent = (delta_raw / delta_timestamp) * 100.0 / self.cpu_count
+            if cpu_percent < 0.1:
+                continue
+            activity.append({"pid": pid, "name": base_name, "cpu_percent": cpu_percent})
+            if elapsed:
+                self.process_score[base_name] += cpu_percent * elapsed
+                self.process_peak[base_name] = max(self.process_peak[base_name], cpu_percent)
+
+        self.last_raw = current
+        activity.sort(key=lambda item: item["cpu_percent"], reverse=True)
+        return activity
+
+    def sample(
+        self,
+        snap: dict,
+        eta: str,
+        system_watts: float | None,
+        display_watts: float | None,
+        charging: bool,
+    ) -> None:
+        now = time.time()
+        if now - self.last_sample_time < POWER_DIARY_INTERVAL:
+            return
+        elapsed = now - self.last_sample_time if self.last_sample_time else None
+        self.last_sample_time = now
+
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        activity = self.read_process_cpu(elapsed)
+        top_activity = activity[:POWER_DIARY_TOP_N]
+        if elapsed and system_watts:
+            self.power_seconds += system_watts * elapsed
+            self.power_sample_seconds += elapsed
+        self.sample_count += 1
+
+        top_text = "; ".join(f"{item['name']}#{item['pid']}={item['cpu_percent']:.1f}%" for item in top_activity)
+        self.append_csv(
+            self.power_path,
+            [
+                "timestamp",
+                "online",
+                "charging",
+                "battery_percent",
+                "remaining_wh",
+                "eta",
+                "system_watts",
+                "display_watts",
+                "top_processes_by_cpu",
+            ],
+            [
+                timestamp,
+                bool(snap.get("online")),
+                charging,
+                snap.get("percent"),
+                snap.get("remaining_wh"),
+                eta,
+                "" if system_watts is None else f"{system_watts:.2f}",
+                "" if display_watts is None else f"{display_watts:.2f}",
+                top_text,
+            ],
+        )
+
+        for item in top_activity:
+            cpu_guess_w = ""
+            if system_watts:
+                cpu_guess_w = f"{system_watts * min(item['cpu_percent'], 100.0) / 100.0:.2f}"
+            self.append_csv(
+                self.process_path,
+                ["timestamp", "pid", "name", "cpu_percent", "cpu_weighted_w_guess"],
+                [timestamp, item["pid"], item["name"], f"{item['cpu_percent']:.2f}", cpu_guess_w],
+            )
+
+        if self.process_score and (
+            self.last_summary_time == 0.0 or now - self.last_summary_time >= POWER_DIARY_SUMMARY_INTERVAL
+        ):
+            self.last_summary_time = now
+            self.write_summary(timestamp)
+
+    def write_summary(self, timestamp: str) -> None:
+        top = sorted(self.process_score.items(), key=lambda item: item[1], reverse=True)[:15]
+        avg_power = None
+        if self.power_sample_seconds > 0:
+            avg_power = self.power_seconds / self.power_sample_seconds
+
+        lines = [
+            "Surface Battery Widget power diary",
+            f"Updated: {timestamp}",
+            f"Samples: {self.sample_count}",
+            f"Average system power: {'--' if avg_power is None else f'{avg_power:.1f} W'}",
+            "",
+            "Top process activity since widget start:",
+        ]
+        if not top:
+            lines.append("No process activity baseline yet; wait for another sample.")
+        else:
+            for index, (name, score) in enumerate(top, 1):
+                peak = self.process_peak.get(name, 0.0)
+                lines.append(f"{index:2d}. {name:<28} score={score:8.1f} peak_cpu={peak:5.1f}%")
+        lines.extend(["", "Suggested power-saving actions:"])
+        for tip in power_saving_recommendations([name for name, _ in top]):
+            lines.append(f"- {tip}")
+        lines.extend(
+            [
+                "",
+                "Reading guide:",
+                "Process scores are CPU activity over time, not exact per-app watts.",
+                "Use this to find apps that correlate with high total power, then limit or close them.",
+            ]
+        )
+        try:
+            self.summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as exc:
+            log(f"Power diary summary write failed: {exc}")
+
+
 class SurfaceBatteryWidget:
     def __init__(self) -> None:
         cleanup_old_startup()
@@ -659,12 +910,16 @@ class SurfaceBatteryWidget:
         self.dpi = 96
         self.width = LOGICAL_WIDTH
         self.height = LOGICAL_HEIGHT
+        self.diary = PowerDiary()
         self.class_name = "SurfaceBatteryWidgetV10Window"
         self.hinst = win32api.GetModuleHandle(None)
         self.hwnd = None
         self.last_eta = "--"
         self.last_watts = None
         self.last_charging = False
+        self.relock_until = 0.0
+        self.relock_reason = ""
+        self.last_update_wall = time.time()
         self.running = False
         self.last_menu_time = 0.0
         self._register_window()
@@ -756,14 +1011,35 @@ class SurfaceBatteryWidget:
         )
         log(f"Position locked: {x},{y},{self.width},{self.height},dpi={self.dpi}")
 
+    def request_relock(self, reason: str, duration: float = RESUME_RELOCK_SECONDS) -> None:
+        if self.allow_drag:
+            return
+        self.relock_until = max(self.relock_until, time.monotonic() + duration)
+        self.relock_reason = reason
+        log(f"Relock requested: {reason}")
+        self.refresh_dpi()
+        self.lock_position()
+        self.render()
+
+    def maybe_relock(self) -> None:
+        if self.allow_drag or time.monotonic() > self.relock_until:
+            return
+        self.refresh_dpi()
+        self.lock_position()
+
     def update_data(self) -> None:
+        now_wall = time.time()
+        if now_wall - self.last_update_wall > 10:
+            self.request_relock(f"update gap {now_wall - self.last_update_wall:.1f}s", RESUME_RELOCK_SECONDS)
+        self.last_update_wall = now_wall
         self.tick += 1
         if self.tick == 1 or self.tick % 5 == 0:
             snap = self.battery.refresh()
         else:
             snap = self.battery.snapshot
         mw = self.power.read_mw()
-        watts = mw / 1000.0 if mw else None
+        system_watts = mw / 1000.0 if mw else None
+        watts = system_watts
         remaining = snap.get("remaining_wh")
         charging = False
         if snap.get("online"):
@@ -783,6 +1059,11 @@ class SurfaceBatteryWidget:
         self.last_watts = watts
         self.last_charging = charging
         self.render()
+        self.maybe_relock()
+        try:
+            self.diary.sample(snap, eta, system_watts, watts, charging)
+        except Exception as exc:
+            log(f"Power diary sample failed: {exc}")
         if self.tick <= 5 or self.tick % 30 == 0:
             watts_text = "--" if watts is None else f"{watts:.1f}W"
             log(f"Tick {self.tick}: eta={eta}, watts={watts_text}")
@@ -859,6 +1140,10 @@ class SurfaceBatteryWidget:
             )
             win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_RELOCK, "Re-lock to right edge")
             win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+            win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_OPEN_DIARY_SUMMARY, "Open power summary")
+            win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_OPEN_DIARY_FOLDER, "Open power diary folder")
+            win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_RUN_SCREEN_OFF_TEST, "Measure screen-off power")
+            win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
             win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_EXIT, "Exit")
             x, y = win32gui.GetCursorPos()
             win32gui.SetForegroundWindow(self.hwnd)
@@ -890,6 +1175,14 @@ class SurfaceBatteryWidget:
         elif command == MENU_RELOCK:
             self.allow_drag = False
             self.lock_position()
+        elif command == MENU_OPEN_DIARY_SUMMARY:
+            self.diary.write_summary(time.strftime("%Y-%m-%d %H:%M:%S"))
+            open_path(self.diary.summary_path)
+        elif command == MENU_OPEN_DIARY_FOLDER:
+            open_path(DIARY_DIR)
+        elif command == MENU_RUN_SCREEN_OFF_TEST:
+            script = BASE_DIR / "Measure_ScreenOffPower.cmd"
+            open_path(script if script.exists() else BASE_DIR)
         elif command == MENU_EXIT:
             win32gui.DestroyWindow(self.hwnd)
 
@@ -925,14 +1218,17 @@ class SurfaceBatteryWidget:
                 win32gui.SendMessage(hwnd, win32con.WM_NCLBUTTONDOWN, win32con.HTCAPTION, 0)
             return 0
         if msg == WM_DPICHANGED:
-            self.refresh_dpi()
-            self.lock_position()
-            self.render()
+            self.request_relock("dpi changed", 3.0)
             return 0
         if msg == win32con.WM_DISPLAYCHANGE:
-            self.refresh_dpi()
-            self.lock_position()
-            self.render()
+            self.request_relock("display changed", 5.0)
+            return 0
+        if msg == WM_SETTINGCHANGE:
+            self.request_relock("system setting changed", 5.0)
+            return 0
+        if msg == WM_POWERBROADCAST:
+            if wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE):
+                self.request_relock(f"power broadcast {wparam}", RESUME_RELOCK_SECONDS)
             return 0
         if msg == win32con.WM_SETTINGCHANGE:
             self.lock_position()
