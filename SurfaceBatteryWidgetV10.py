@@ -1,6 +1,7 @@
 import ctypes
 import csv
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -44,6 +45,7 @@ POWER_DIARY_INTERVAL = 10.0
 POWER_DIARY_SUMMARY_INTERVAL = 60.0
 POWER_DIARY_TOP_N = 12
 MAX_REASONABLE_BATTERY_WATTS = 180.0
+ENERGY_SAVER_STATUS_INTERVAL = 60.0
 
 MENU_TOGGLE_STARTUP = 1001
 MENU_TOGGLE_DRAG = 1002
@@ -51,7 +53,6 @@ MENU_RELOCK = 1003
 MENU_EXIT = 1004
 MENU_OPEN_DIARY_SUMMARY = 1005
 MENU_OPEN_DIARY_FOLDER = 1006
-MENU_RUN_SCREEN_OFF_TEST = 1007
 
 ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
@@ -711,6 +712,40 @@ def power_saving_recommendations(top_names: list[str]) -> list[str]:
     return tips
 
 
+def read_energy_saver_threshold() -> int | None:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\381b4222-f694-41f0-9685-ff5bb260df2e"
+            r"\de830923-a562-41af-a086-e3a2c6bad2da\e69653ca-cf7f-4f05-aa73-cb833fa90ad4",
+        ) as key:
+            return int(winreg.QueryValueEx(key, "DCSettingIndex")[0])
+    except Exception:
+        return None
+
+
+def read_energy_saver_status() -> str:
+    command = (
+        "[Windows.System.Power.PowerManager,Windows.System.Power,ContentType=WindowsRuntime] | Out-Null; "
+        "[Windows.System.Power.PowerManager]::EnergySaverStatus.ToString()"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=0x08000000,
+        )
+        if completed.returncode == 0:
+            status = completed.stdout.strip()
+            if status:
+                return status
+    except Exception as exc:
+        log(f"Energy saver status read failed: {exc}")
+    return "Unknown"
+
+
 class PowerDiary:
     def __init__(self) -> None:
         self.ready = False
@@ -726,7 +761,10 @@ class PowerDiary:
         self.power_seconds = 0.0
         self.power_sample_seconds = 0.0
         self.sample_count = 0
-        self.power_path = DIARY_DIR / "power_samples.csv"
+        self.energy_saver_status = "Unknown"
+        self.energy_saver_threshold = read_energy_saver_threshold()
+        self.last_energy_saver_check = 0.0
+        self.power_path = DIARY_DIR / "power_samples_v2.csv"
         self.process_path = DIARY_DIR / "process_activity.csv"
         self.summary_path = DIARY_DIR / "summary.txt"
         try:
@@ -736,6 +774,14 @@ class PowerDiary:
             log("Power diary initialized")
         except Exception as exc:
             log(f"Power diary initialization failed: {exc}")
+
+    def current_energy_saver_status(self) -> str:
+        now = time.time()
+        if now - self.last_energy_saver_check >= ENERGY_SAVER_STATUS_INTERVAL:
+            self.energy_saver_status = read_energy_saver_status()
+            self.energy_saver_threshold = read_energy_saver_threshold()
+            self.last_energy_saver_check = now
+        return self.energy_saver_status
 
     def append_csv(self, path: Path, header: list[str], row: list) -> None:
         try:
@@ -814,6 +860,12 @@ class PowerDiary:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         activity = self.read_process_cpu(elapsed)
         top_activity = activity[:POWER_DIARY_TOP_N]
+        energy_saver_status = self.current_energy_saver_status()
+        threshold = self.energy_saver_threshold
+        energy_saver_expected = (
+            bool(not snap.get("online") and threshold is not None and snap.get("percent") is not None)
+            and int(snap.get("percent")) <= threshold
+        )
         if elapsed and system_watts:
             self.power_seconds += system_watts * elapsed
             self.power_sample_seconds += elapsed
@@ -831,6 +883,9 @@ class PowerDiary:
                 "eta",
                 "system_watts",
                 "display_watts",
+                "energy_saver_status",
+                "energy_saver_threshold",
+                "energy_saver_auto_expected",
                 "top_processes_by_cpu",
             ],
             [
@@ -842,6 +897,9 @@ class PowerDiary:
                 eta,
                 "" if system_watts is None else f"{system_watts:.2f}",
                 "" if display_watts is None else f"{display_watts:.2f}",
+                energy_saver_status,
+                "" if threshold is None else threshold,
+                energy_saver_expected,
                 top_text,
             ],
         )
@@ -873,6 +931,8 @@ class PowerDiary:
             f"Updated: {timestamp}",
             f"Samples: {self.sample_count}",
             f"Average system power: {'--' if avg_power is None else f'{avg_power:.1f} W'}",
+            f"Energy saver status: {self.energy_saver_status}",
+            f"Energy saver auto threshold: {'--' if self.energy_saver_threshold is None else str(self.energy_saver_threshold) + '%'}",
             "",
             "Top process activity since widget start:",
         ]
@@ -1142,7 +1202,6 @@ class SurfaceBatteryWidget:
             win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
             win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_OPEN_DIARY_SUMMARY, "Open power summary")
             win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_OPEN_DIARY_FOLDER, "Open power diary folder")
-            win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_RUN_SCREEN_OFF_TEST, "Measure screen-off power")
             win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
             win32gui.AppendMenu(menu, win32con.MF_STRING, MENU_EXIT, "Exit")
             x, y = win32gui.GetCursorPos()
@@ -1180,9 +1239,6 @@ class SurfaceBatteryWidget:
             open_path(self.diary.summary_path)
         elif command == MENU_OPEN_DIARY_FOLDER:
             open_path(DIARY_DIR)
-        elif command == MENU_RUN_SCREEN_OFF_TEST:
-            script = BASE_DIR / "Measure_ScreenOffPower.cmd"
-            open_path(script if script.exists() else BASE_DIR)
         elif command == MENU_EXIT:
             win32gui.DestroyWindow(self.hwnd)
 
