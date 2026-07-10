@@ -633,16 +633,42 @@ def render_widget_image(
                 "color": secondary
             })
         else:
+            clock_size = round(8 * scale * ss)
+            clock_stroke = max(1, round(0.75 * scale * ss))
+
+            def make_draw_clock(size, stroke, color):
+                def draw_clock(d, x, y):
+                    inset = max(1, stroke // 2)
+                    center_x = x + size // 2
+                    center_y = y + size // 2
+                    d.ellipse(
+                        (x + inset, y + inset, x + size - inset, y + size - inset),
+                        outline=color,
+                        width=stroke,
+                    )
+                    d.line(
+                        (center_x, center_y, center_x, y + round(size * 0.27)),
+                        fill=color,
+                        width=stroke,
+                    )
+                    d.line(
+                        (center_x, center_y, x + round(size * 0.72), y + round(size * 0.58)),
+                        fill=color,
+                        width=stroke,
+                    )
+
+                return draw_clock
+
+            segments.append({
+                "type": "icon",
+                "width": clock_size + round(2.5 * scale * ss),
+                "height": clock_size,
+                "draw_fn": make_draw_clock(clock_size, clock_stroke, status_color),
+            })
             segments.append({
                 "type": "text",
                 "text": eta_text,
                 "font": font_val,
-                "color": status_color
-            })
-            segments.append({
-                "type": "text",
-                "text": "m",
-                "font": font_unit,
                 "color": status_color
             })
 
