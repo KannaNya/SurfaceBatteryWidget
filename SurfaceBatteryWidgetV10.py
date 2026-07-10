@@ -679,7 +679,7 @@ def render_widget_image(
             })
             segments.append({
                 "type": "text",
-                "text": "mins",
+                "text": "m",
                 "font": font_unit,
                 "color": status_color
             })
@@ -687,7 +687,7 @@ def render_widget_image(
         # 2. Native taskbar-style whitespace between the two values.
         segments.append({
             "type": "spacer",
-            "width": round(2 * scale * ss),
+            "width": round(5 * scale * ss),
         })
 
         if temperature_text:
@@ -699,7 +699,7 @@ def render_widget_image(
             })
             segments.append({
                 "type": "spacer",
-                "width": round(2 * scale * ss),
+                "width": round(5 * scale * ss),
             })
 
         # 3. Wattage Segment
@@ -720,7 +720,7 @@ def render_widget_image(
             })
             segments.append({
                 "type": "text",
-                "text": "W",
+                "text": "w",
                 "font": font_unit,
                 "color": primary
             })
