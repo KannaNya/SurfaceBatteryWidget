@@ -615,15 +615,13 @@ def render_widget_image(
                 temperature_color = "#ff6b72"
             elif temperature_value >= 50:
                 temperature_color = "#ff9d5c"
-            else:
-                temperature_color = primary
         except ValueError:
             pass
 
     # Match the visual weight of Win11 taskbar status text, with tighter labels.
     val_size = round(UI_FONT_SIZE_DIP * scale * ss)
     unit_size = val_size
-    max_width = card_w * ss - round(4 * scale * ss)
+    max_width = card_w * ss - round(2 * scale * ss)
 
     # Scale down sizes if text runs too wide (adaptive fitting)
     for size_reduce in range(0, 5):
@@ -673,49 +671,23 @@ def render_widget_image(
                 "color": secondary
             })
         else:
-            clock_size = round(8 * scale * ss)
-            clock_stroke = max(1, round(0.75 * scale * ss))
-
-            def make_draw_clock(size, stroke, color):
-                def draw_clock(d, x, y):
-                    inset = max(1, stroke // 2)
-                    center_x = x + size // 2
-                    center_y = y + size // 2
-                    d.ellipse(
-                        (x + inset, y + inset, x + size - inset, y + size - inset),
-                        outline=color,
-                        width=stroke,
-                    )
-                    d.line(
-                        (center_x, center_y, center_x, y + round(size * 0.27)),
-                        fill=color,
-                        width=stroke,
-                    )
-                    d.line(
-                        (center_x, center_y, x + round(size * 0.72), y + round(size * 0.58)),
-                        fill=color,
-                        width=stroke,
-                    )
-
-                return draw_clock
-
-            segments.append({
-                "type": "icon",
-                "width": clock_size + round(2.5 * scale * ss),
-                "height": clock_size,
-                "draw_fn": make_draw_clock(clock_size, clock_stroke, status_color),
-            })
             segments.append({
                 "type": "text",
                 "text": eta_text,
                 "font": font_val,
                 "color": status_color
             })
+            segments.append({
+                "type": "text",
+                "text": "mins",
+                "font": font_unit,
+                "color": secondary
+            })
 
         # 2. Native taskbar-style whitespace between the two values.
         segments.append({
             "type": "spacer",
-            "width": round(3 * scale * ss),
+            "width": round(2 * scale * ss),
         })
 
         if temperature_text:
@@ -727,7 +699,7 @@ def render_widget_image(
             })
             segments.append({
                 "type": "spacer",
-                "width": round(3 * scale * ss),
+                "width": round(2 * scale * ss),
             })
 
         # 3. Wattage Segment
