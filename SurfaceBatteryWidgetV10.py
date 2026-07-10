@@ -25,7 +25,7 @@ MUTEX_NAME = "Global\\SurfaceBatteryWidgetV10"
 CONFIG_KEY = r"Software\SurfaceBatteryWidget"
 STARTUP_PREFERENCE_VALUE = "StartupEnabled"
 
-LOGICAL_WIDTH = 95
+LOGICAL_WIDTH = 100
 LOGICAL_HEIGHT = 30
 RIGHT_MARGIN = 89
 EDGE_PAD = 1
@@ -679,7 +679,7 @@ def render_widget_image(
             })
             segments.append({
                 "type": "text",
-                "text": "m",
+                "text": "mins",
                 "font": font_unit,
                 "color": status_color
             })
@@ -687,7 +687,7 @@ def render_widget_image(
         # 2. Native taskbar-style whitespace between the two values.
         segments.append({
             "type": "spacer",
-            "width": round(5 * scale * ss),
+            "width": round(4 * scale * ss),
         })
 
         if temperature_text:
@@ -699,7 +699,7 @@ def render_widget_image(
             })
             segments.append({
                 "type": "spacer",
-                "width": round(5 * scale * ss),
+                "width": round(4 * scale * ss),
             })
 
         # 3. Wattage Segment
@@ -720,7 +720,7 @@ def render_widget_image(
             })
             segments.append({
                 "type": "text",
-                "text": "w",
+                "text": "W",
                 "font": font_unit,
                 "color": primary
             })
