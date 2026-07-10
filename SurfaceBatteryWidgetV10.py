@@ -607,7 +607,7 @@ def render_widget_image(
     else:
         status_color = secondary
 
-    temperature_color = secondary
+    temperature_color = primary
     if temperature_text and temperature_text != "--":
         try:
             temperature_value = float(temperature_text.rstrip("°C"))
@@ -681,7 +681,7 @@ def render_widget_image(
                 "type": "text",
                 "text": "mins",
                 "font": font_unit,
-                "color": secondary
+                "color": status_color
             })
 
         # 2. Native taskbar-style whitespace between the two values.
