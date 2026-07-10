@@ -11,10 +11,12 @@ Variable and a theme-aware native layered window.
 
 - Reads system power from the Windows PDH `Power Meter` counter.
 - Reads remaining battery capacity and AC state through WMI.
+- Reads the hottest valid ACPI thermal zone every five seconds.
 - Recalculates the ETA once per second while keeping sensor work on the window
   thread and using a lightweight wake-up worker.
 - Uses a native Win32 per-pixel-alpha layered window.
 - Matches the Win11 taskbar font metrics and dark/light system theme.
+- Displays remaining minutes, device temperature, and live watts in one row.
 - Supports per-monitor DPI scaling, always-on-top display, drag locking,
   right-edge positioning, a right-click menu, and per-user startup.
 - Re-locks itself for several seconds after resume, display changes, DPI

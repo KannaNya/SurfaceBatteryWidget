@@ -25,9 +25,9 @@ MUTEX_NAME = "Global\\SurfaceBatteryWidgetV10"
 CONFIG_KEY = r"Software\SurfaceBatteryWidget"
 STARTUP_PREFERENCE_VALUE = "StartupEnabled"
 
-LOGICAL_WIDTH = 82
+LOGICAL_WIDTH = 95
 LOGICAL_HEIGHT = 30
-RIGHT_MARGIN = 72
+RIGHT_MARGIN = 89
 EDGE_PAD = 1
 BOTTOM_MARGIN = -1
 CARD_RADIUS = 4
@@ -308,6 +308,31 @@ class BatteryReader:
         return self.snapshot
 
 
+class ThermalReader:
+    def __init__(self) -> None:
+        self.wmi = win32com.client.GetObject("winmgmts:")
+        self.temperature_c: float | None = None
+
+    def refresh(self) -> float | None:
+        try:
+            rows = self.wmi.ExecQuery(
+                "SELECT Temperature,HighPrecisionTemperature "
+                "FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation"
+            )
+            temperatures = []
+            for row in rows:
+                high_precision = float(row.HighPrecisionTemperature or 0)
+                kelvin = high_precision / 10.0 if high_precision >= 1000 else float(row.Temperature or 0)
+                temperature_c = kelvin - 273.15
+                if 0.0 < temperature_c < 120.0:
+                    temperatures.append(temperature_c)
+            if temperatures:
+                self.temperature_c = max(temperatures)
+        except Exception as exc:
+            log(f"Thermal-zone read failed: {exc}")
+        return self.temperature_c
+
+
 def startup_dir() -> Path:
     return Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
@@ -520,6 +545,7 @@ def render_widget_image(
     watts_text: str,
     dpi: int = 96,
     charging: bool = False,
+    temperature_text: str | None = None,
 ) -> Image.Image:
     scale = dpi / 96.0
     width = max(1, round(LOGICAL_WIDTH * scale))
@@ -580,6 +606,19 @@ def render_widget_image(
             status_color = primary
     else:
         status_color = secondary
+
+    temperature_color = secondary
+    if temperature_text and temperature_text != "--":
+        try:
+            temperature_value = float(temperature_text.rstrip("°C"))
+            if temperature_value >= 60:
+                temperature_color = "#ff6b72"
+            elif temperature_value >= 50:
+                temperature_color = "#ff9d5c"
+            else:
+                temperature_color = primary
+        except ValueError:
+            pass
 
     # Match the visual weight of Win11 taskbar status text, with tighter labels.
     val_size = round(UI_FONT_SIZE_DIP * scale * ss)
@@ -676,8 +715,20 @@ def render_widget_image(
         # 2. Native taskbar-style whitespace between the two values.
         segments.append({
             "type": "spacer",
-            "width": round(5 * scale * ss),
+            "width": round(3 * scale * ss),
         })
+
+        if temperature_text:
+            segments.append({
+                "type": "text",
+                "text": temperature_text,
+                "font": font_val,
+                "color": temperature_color,
+            })
+            segments.append({
+                "type": "spacer",
+                "width": round(3 * scale * ss),
+            })
 
         # 3. Wattage Segment
         if watts_text == "--":
@@ -1036,6 +1087,7 @@ class SurfaceBatteryWidget:
         initialize_startup()
         self.power = PdhPowerMeter()
         self.battery = BatteryReader()
+        self.thermal = ThermalReader()
         self.tick = 0
         self.allow_drag = False
         self.dpi = 96
@@ -1047,6 +1099,7 @@ class SurfaceBatteryWidget:
         self.hwnd = None
         self.last_eta = "--"
         self.last_watts = None
+        self.last_temperature_c = None
         self.last_charging = False
         self.relock_until = 0.0
         self.last_update_wall = time.time()
@@ -1164,8 +1217,10 @@ class SurfaceBatteryWidget:
         self.tick += 1
         if self.tick == 1 or self.tick % 5 == 0:
             snap = self.battery.refresh()
+            temperature_c = self.thermal.refresh()
         else:
             snap = self.battery.snapshot
+            temperature_c = self.thermal.temperature_c
         mw = self.power.read_mw()
         system_watts = mw / 1000.0 if mw else None
         watts = system_watts
@@ -1186,6 +1241,7 @@ class SurfaceBatteryWidget:
             eta = "--"
         self.last_eta = eta
         self.last_watts = watts
+        self.last_temperature_c = temperature_c
         self.last_charging = charging
         self.render()
         self.maybe_relock()
@@ -1195,11 +1251,19 @@ class SurfaceBatteryWidget:
             log(f"Power diary sample failed: {exc}")
         if self.tick <= 5 or self.tick % 30 == 0:
             watts_text = "--" if watts is None else f"{watts:.1f}W"
-            log(f"Tick {self.tick}: eta={eta}, watts={watts_text}")
+            temperature_text = "--" if temperature_c is None else f"{temperature_c:.1f}C"
+            log(f"Tick {self.tick}: eta={eta}, temp={temperature_text}, watts={watts_text}")
 
     def render(self) -> None:
         watts_text = "--" if self.last_watts is None else f"{self.last_watts:.1f}W"
-        image = render_widget_image(self.last_eta, watts_text, self.dpi, self.last_charging)
+        temperature_text = "--" if self.last_temperature_c is None else f"{round(self.last_temperature_c):.0f}°"
+        image = render_widget_image(
+            self.last_eta,
+            watts_text,
+            self.dpi,
+            self.last_charging,
+            temperature_text,
+        )
         self.width, self.height = image.size
         self.update_layered_window(image)
 
