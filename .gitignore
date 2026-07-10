@@ -7,6 +7,7 @@ __pycache__/
 *.jpeg
 *.webp
 power-diary/
+tmp/
 
 # Local/private context
 codex_memory.md

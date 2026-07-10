@@ -1,7 +1,6 @@
 import ctypes
 import csv
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -14,7 +13,7 @@ import win32com.client
 import win32con
 import win32gui
 import winreg
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,15 +22,19 @@ DIARY_DIR = BASE_DIR / "power-diary"
 START_CMD = BASE_DIR / "Start_SurfaceBatteryWidgetV10.cmd"
 APP_NAME = "SurfaceBatteryWidgetV10"
 MUTEX_NAME = "Global\\SurfaceBatteryWidgetV10"
+CONFIG_KEY = r"Software\SurfaceBatteryWidget"
+STARTUP_PREFERENCE_VALUE = "StartupEnabled"
 
 LOGICAL_WIDTH = 82
 LOGICAL_HEIGHT = 30
 RIGHT_MARGIN = 78
-SHADOW_PAD = 1
+EDGE_PAD = 1
 BOTTOM_MARGIN = -2
 CARD_RADIUS = 4
+UI_FONT_SIZE_DIP = 12.5
+UI_FONT_WEIGHT = 450
+UI_FONT_OPTICAL_SIZE = 13
 
-TIMER_ID = 1
 TIMER_MS = 1000
 WM_APP_UPDATE = win32con.WM_APP + 10
 WM_DPICHANGED = 0x02E0
@@ -46,6 +49,8 @@ POWER_DIARY_SUMMARY_INTERVAL = 60.0
 POWER_DIARY_TOP_N = 12
 MAX_REASONABLE_BATTERY_WATTS = 180.0
 ENERGY_SAVER_STATUS_INTERVAL = 60.0
+MAX_LOG_BYTES = 2 * 1024 * 1024
+MAX_DIARY_BYTES = 8 * 1024 * 1024
 
 MENU_TOGGLE_STARTUP = 1001
 MENU_TOGGLE_DRAG = 1002
@@ -105,6 +110,17 @@ class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
 
 
+class SYSTEM_POWER_STATUS(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
+        ("BatteryLifeTime", wintypes.DWORD),
+        ("BatteryFullLifeTime", wintypes.DWORD),
+    ]
+
+
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateDIBSection.argtypes = [
@@ -135,15 +151,21 @@ user32.UpdateLayeredWindow.argtypes = [
     wintypes.DWORD,
 ]
 user32.UpdateLayeredWindow.restype = wintypes.BOOL
-UINT_PTR = ctypes.c_size_t
-user32.SetTimer.argtypes = [wintypes.HWND, UINT_PTR, wintypes.UINT, wintypes.LPVOID]
-user32.SetTimer.restype = UINT_PTR
-user32.KillTimer.argtypes = [wintypes.HWND, UINT_PTR]
-user32.KillTimer.restype = wintypes.BOOL
+kernel32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(SYSTEM_POWER_STATUS)]
+kernel32.GetSystemPowerStatus.restype = wintypes.BOOL
+
+
+def rotate_file(path: Path, max_bytes: int) -> None:
+    if not path.exists() or path.stat().st_size < max_bytes:
+        return
+    backup = path.with_name(path.name + ".1")
+    backup.unlink(missing_ok=True)
+    path.replace(backup)
 
 
 def log(message: str) -> None:
     try:
+        rotate_file(LOG_PATH, MAX_LOG_BYTES)
         with LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
     except Exception:
@@ -289,6 +311,10 @@ def startup_dir() -> Path:
     return Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
 
+def startup_shortcut_path() -> Path:
+    return startup_dir() / "Surface Battery Widget V10.lnk"
+
+
 def cleanup_old_startup() -> None:
     for name in (
         "Surface Battery Widget.lnk",
@@ -298,6 +324,8 @@ def cleanup_old_startup() -> None:
         "Surface Battery Widget V5.lnk",
         "Surface Battery Widget V6.lnk",
         "Surface Battery Widget V7.lnk",
+        "Surface Battery Widget V8.lnk",
+        "Surface Battery Widget V9.lnk",
     ):
         try:
             (startup_dir() / name).unlink(missing_ok=True)
@@ -318,6 +346,8 @@ def cleanup_old_startup() -> None:
                 "SurfaceBatteryWidgetV5",
                 "SurfaceBatteryWidgetV6",
                 "SurfaceBatteryWidgetV7",
+                "SurfaceBatteryWidgetV8",
+                "SurfaceBatteryWidgetV9",
             ):
                 try:
                     winreg.DeleteValue(key, name)
@@ -331,6 +361,7 @@ def enable_startup() -> None:
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     exe = pythonw if pythonw.exists() else Path(sys.executable)
     command = f'"{exe}" "{Path(__file__).resolve()}"'
+    run_enabled = False
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -339,13 +370,21 @@ def enable_startup() -> None:
             winreg.KEY_SET_VALUE,
         ) as key:
             winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
+        run_enabled = True
         log("HKCU Run enabled")
     except Exception as exc:
         log(f"HKCU Run failed: {exc}")
 
+    if run_enabled:
+        try:
+            startup_shortcut_path().unlink(missing_ok=True)
+        except Exception as exc:
+            log(f"Startup shortcut cleanup failed: {exc}")
+        return
+
     try:
         shell = win32com.client.Dispatch("WScript.Shell")
-        shortcut = shell.CreateShortcut(str(startup_dir() / "Surface Battery Widget V10.lnk"))
+        shortcut = shell.CreateShortcut(str(startup_shortcut_path()))
         shortcut.TargetPath = str(START_CMD)
         shortcut.WorkingDirectory = str(BASE_DIR)
         shortcut.Description = "Surface Battery Widget V10"
@@ -370,7 +409,7 @@ def disable_startup() -> None:
     except Exception:
         pass
     try:
-        (startup_dir() / "Surface Battery Widget V10.lnk").unlink(missing_ok=True)
+        startup_shortcut_path().unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -381,7 +420,46 @@ def startup_enabled() -> bool:
             winreg.QueryValueEx(key, APP_NAME)
             return True
     except Exception:
-        return (startup_dir() / "Surface Battery Widget V10.lnk").exists()
+        return startup_shortcut_path().exists()
+
+
+def read_startup_preference() -> bool | None:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CONFIG_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, STARTUP_PREFERENCE_VALUE)
+            return bool(value)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        log(f"Startup preference read failed: {exc}")
+        return None
+
+
+def write_startup_preference(enabled: bool) -> None:
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, CONFIG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, STARTUP_PREFERENCE_VALUE, 0, winreg.REG_DWORD, int(enabled))
+    except Exception as exc:
+        log(f"Startup preference write failed: {exc}")
+
+
+def set_startup_enabled(enabled: bool) -> None:
+    write_startup_preference(enabled)
+    if enabled:
+        enable_startup()
+    else:
+        disable_startup()
+
+
+def initialize_startup() -> None:
+    preference = read_startup_preference()
+    if preference is None:
+        preference = True
+        write_startup_preference(preference)
+    if preference:
+        enable_startup()
+    else:
+        disable_startup()
 
 
 def format_eta(hours: float | None) -> str:
@@ -405,113 +483,77 @@ def format_charge_eta(remaining_wh: float | None, full_charge_wh: float | None, 
 FONT_DIR = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 
 
-def load_font(name: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+def load_font(
+    name: str,
+    size: int,
+    weight: int = 400,
+    optical_size: int = 13,
+) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for filename in (name, "seguisb.ttf", "segoeuib.ttf", "segoeui.ttf", "msyh.ttc", "arial.ttf"):
         path = FONT_DIR / filename
         if path.exists():
-            return ImageFont.truetype(str(path), size)
+            font = ImageFont.truetype(str(path), size)
+            if filename.lower() == "seguivar.ttf":
+                try:
+                    font.set_variation_by_axes([weight, optical_size])
+                except (AttributeError, OSError):
+                    pass
+            return font
     return ImageFont.load_default()
 
 
-def text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
-    box = draw.textbbox((0, 0), text, font=font)
-    return box[2] - box[0]
+def system_uses_light_theme() -> bool:
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
+            return bool(value)
+    except Exception:
+        return False
 
 
-def fit_font(draw: ImageDraw.ImageDraw, text: str, font_name: str, start_size: int, min_size: int, max_width: int):
-    font = load_font(font_name, start_size)
-    size = start_size
-    while text_width(draw, text, font) > max_width and size > min_size:
-        size -= 1
-        font = load_font(font_name, size)
-    return font
-
-
-def fit_shared_font(
-    draw: ImageDraw.ImageDraw,
-    texts: list[str],
-    font_name: str,
-    start_size: int,
-    min_size: int,
-    max_width: int,
-):
-    font = load_font(font_name, start_size)
-    size = start_size
-    while any(text_width(draw, text, font) > max_width for text in texts) and size > min_size:
-        size -= 1
-        font = load_font(font_name, size)
-    return font
-
-
-def centered_text(draw: ImageDraw.ImageDraw, width: int, y: int, text: str, font, fill: str) -> None:
-    draw.text(((width - text_width(draw, text, font)) // 2, y), text, font=font, fill=fill)
-
-
-def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96, charging: bool = False) -> Image.Image:
+def render_widget_image(
+    eta_text: str,
+    watts_text: str,
+    dpi: int = 96,
+    charging: bool = False,
+) -> Image.Image:
     scale = dpi / 96.0
     width = max(1, round(LOGICAL_WIDTH * scale))
     height = max(1, round(LOGICAL_HEIGHT * scale))
-    pad = max(1, round(SHADOW_PAD * scale))
+    pad = max(1, round(EDGE_PAD * scale))
     card_w = width - pad * 2
     card_h = height - pad * 2
     radius = max(1, round(CARD_RADIUS * scale))
     ss = 4
 
-    # Shadow layer (offset 1px down for natural light direction)
-    shadow = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    shadow_offset = max(1, round(scale * ss))
-    sr = (pad * ss, pad * ss + shadow_offset,
-          (pad + card_w) * ss - 1, (pad + card_h) * ss - 1 + shadow_offset)
-    sd.rounded_rectangle(sr, radius=radius * ss, fill=(0, 0, 0, 40))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(1, round(2.5 * scale * ss))))
+    light_theme = system_uses_light_theme()
+    if light_theme:
+        card_fill = (243, 243, 243, 255)
+        border_fill = (0, 0, 0, 24)
+        primary = (26, 26, 26, 255)
+        secondary = (92, 92, 92, 255)
+    else:
+        # Sampled from this machine's translucent Win11 taskbar surface.
+        card_fill = (40, 41, 44, 255)
+        border_fill = (255, 255, 255, 18)
+        primary = (255, 255, 255, 255)
+        secondary = (166, 166, 166, 255)
 
-    # Card layer: Mica dark gray theme with vertical gradient
-    card = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
-    
-    # Create gradient fill image for the card area (Mica dark gray theme)
-    gradient = Image.new("RGBA", (1, card_h * ss))
-    for y in range(card_h * ss):
-        # Subtle top-to-bottom dark theme gradient:
-        # Top: (32, 32, 32, 225), Bottom: (24, 24, 24, 215)
-        factor = y / max(1, card_h * ss - 1)
-        r = int(32 - factor * 8)
-        g = int(32 - factor * 8)
-        b = int(32 - factor * 8)
-        a = int(225 - factor * 10)
-        gradient.putpixel((0, y), (r, g, b, a))
-    gradient = gradient.resize((card_w * ss, card_h * ss), Image.Resampling.BILINEAR)
-
-    # Rounded rectangle mask for the card shape
-    mask = Image.new("L", (card_w * ss, card_h * ss), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.rounded_rectangle((0, 0, card_w * ss - 1, card_h * ss - 1), radius=radius * ss, fill=255)
-
-    # Paste gradient onto card
-    card.paste(gradient, (pad * ss, pad * ss), mask)
-
-    # Draw border and 3D highlights
-    cd = ImageDraw.Draw(card)
-    cr = (pad * ss, pad * ss, (pad + card_w) * ss - 1, (pad + card_h) * ss - 1)
-    
-    # Subtle all-around thin border (Mica style)
-    cd.rounded_rectangle(cr, radius=radius * ss,
-                         outline=(255, 255, 255, 10), width=max(1, round(scale * ss)))
-                         
-    # Top highlight line inside the rounded rect flat top part
-    line_w = max(1, round(scale * ss))
-    cd.line((pad * ss + radius * ss, pad * ss, (pad + card_w) * ss - radius * ss, pad * ss),
-            fill=(255, 255, 255, 30), width=line_w)
-            
-    # Bottom shadow line
-    cd.line((pad * ss + radius * ss, (pad + card_h) * ss - 1, (pad + card_w) * ss - radius * ss, (pad + card_h) * ss - 1),
-            fill=(0, 0, 0, 30), width=line_w)
-
-    # Composite shadow + card
-    img = Image.alpha_composite(shadow, card)
-
-    # Draw text at 4x supersampled resolution for crisp rendering
+    # Match Win11 taskbar surfaces: one translucent layer, a hairline border,
+    # and no simulated bevel, painted gradient, or heavy shadow.
+    img = Image.new("RGBA", (width * ss, height * ss), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
+    cr = (pad * ss, pad * ss, (pad + card_w) * ss - 1, (pad + card_h) * ss - 1)
+    draw.rounded_rectangle(
+        cr,
+        radius=radius * ss,
+        fill=card_fill,
+        outline=border_fill,
+        width=max(1, round(0.5 * scale * ss)),
+    )
     
     # Parse remaining minutes for status coloring
     minutes = None
@@ -527,26 +569,31 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96, charging:
     # Status color logic. Charging ETA is positive information, so warning
     # colors only apply while the battery is discharging.
     if charging or eta_text == "AC":
-        status_color = "#f0f6fc"  # Standard white
+        status_color = primary
     elif minutes is not None:
         if minutes < 20:
             status_color = "#ff6b72"  # Fluent Soft Red
         elif minutes < 45:
             status_color = "#ff9d5c"  # Fluent Soft Orange
         else:
-            status_color = "#f0f6fc"  # Normal White
+            status_color = primary
     else:
-        status_color = "#8b949e"  # Normal Gray
+        status_color = secondary
 
     # Match the visual weight of Win11 taskbar status text, with tighter labels.
-    val_size = round(11.5 * scale * ss)
-    unit_size = round(11.5 * scale * ss)
-    max_width = card_w * ss - round(1 * scale * ss)
+    val_size = round(UI_FONT_SIZE_DIP * scale * ss)
+    unit_size = val_size
+    max_width = card_w * ss - round(4 * scale * ss)
 
     # Scale down sizes if text runs too wide (adaptive fitting)
     for size_reduce in range(0, 5):
-        font_val = load_font("seguisb.ttf", val_size - size_reduce * ss)
-        font_unit = load_font("segoeui.ttf", unit_size - size_reduce * ss)
+        font_val = load_font(
+            "SegUIVar.ttf",
+            val_size - size_reduce * ss,
+            UI_FONT_WEIGHT,
+            UI_FONT_OPTICAL_SIZE,
+        )
+        font_unit = font_val
         
         segments = []
         
@@ -564,8 +611,8 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96, charging:
                     (x + w * 0.35, y + h),
                     (x + w * 0.85, y + h * 0.45),
                     (x + w * 0.45, y + h * 0.45)
-                ], fill=(240, 246, 252, 255))  # Clean white/gray lightning
-                
+                ], fill=primary)
+
             segments.append({
                 "type": "icon",
                 "width": icon_w + round(3 * scale * ss),
@@ -576,14 +623,14 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96, charging:
                 "type": "text",
                 "text": "AC",
                 "font": font_val,
-                "color": "#f0f6fc"
+                "color": primary
             })
         elif eta_text in ("--", "FULL"):
             segments.append({
                 "type": "text",
                 "text": eta_text,
                 "font": font_val,
-                "color": "#8b949e"
+                "color": secondary
             })
         else:
             segments.append({
@@ -596,24 +643,22 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96, charging:
                 "type": "text",
                 "text": "m",
                 "font": font_unit,
-                "color": "#8b949e"
+                "color": status_color
             })
-            
-        # 2. Separator
+
+        # 2. Native taskbar-style whitespace between the two values.
         segments.append({
-            "type": "text",
-            "text": " ",
-            "font": font_unit,
-            "color": "#8b949e"
+            "type": "spacer",
+            "width": round(5 * scale * ss),
         })
-        
+
         # 3. Wattage Segment
         if watts_text == "--":
             segments.append({
                 "type": "text",
                 "text": "--",
                 "font": font_val,
-                "color": "#8b949e"
+                "color": secondary
             })
         else:
             val = watts_text[:-1] if watts_text.endswith("W") else watts_text
@@ -621,15 +666,15 @@ def render_widget_image(eta_text: str, watts_text: str, dpi: int = 96, charging:
                 "type": "text",
                 "text": val,
                 "font": font_val,
-                "color": "#f0f6fc"
+                "color": primary
             })
             segments.append({
                 "type": "text",
                 "text": "W",
                 "font": font_unit,
-                "color": "#8b949e"
+                "color": primary
             })
-            
+
         # Calculate width of all segments
         total_w = 0
         for seg in segments:
@@ -714,10 +759,14 @@ def power_saving_recommendations(top_names: list[str]) -> list[str]:
 
 def read_energy_saver_threshold() -> int | None:
     try:
+        schemes_key = r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, schemes_key) as key:
+            active_scheme = str(winreg.QueryValueEx(key, "ActivePowerScheme")[0])
         with winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes\381b4222-f694-41f0-9685-ff5bb260df2e"
-            r"\de830923-a562-41af-a086-e3a2c6bad2da\e69653ca-cf7f-4f05-aa73-cb833fa90ad4",
+            schemes_key
+            + rf"\{active_scheme}"
+            + r"\de830923-a562-41af-a086-e3a2c6bad2da\e69653ca-cf7f-4f05-aa73-cb833fa90ad4",
         ) as key:
             return int(winreg.QueryValueEx(key, "DCSettingIndex")[0])
     except Exception:
@@ -725,24 +774,10 @@ def read_energy_saver_threshold() -> int | None:
 
 
 def read_energy_saver_status() -> str:
-    command = (
-        "[Windows.System.Power.PowerManager,Windows.System.Power,ContentType=WindowsRuntime] | Out-Null; "
-        "[Windows.System.Power.PowerManager]::EnergySaverStatus.ToString()"
-    )
-    try:
-        completed = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=4,
-            creationflags=0x08000000,
-        )
-        if completed.returncode == 0:
-            status = completed.stdout.strip()
-            if status:
-                return status
-    except Exception as exc:
-        log(f"Energy saver status read failed: {exc}")
+    status = SYSTEM_POWER_STATUS()
+    if kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+        return "On" if status.SystemStatusFlag else "Off"
+    log(f"Energy saver status read failed: {ctypes.get_last_error()}")
     return "Unknown"
 
 
@@ -754,7 +789,6 @@ class PowerDiary:
         self.cpu_count = max(1, os.cpu_count() or 1)
         self.last_sample_time = 0.0
         self.last_summary_time = 0.0
-        self.started_at = time.time()
         self.last_raw: dict[tuple[int, str], tuple[int, int, str]] = {}
         self.process_score = defaultdict(float)
         self.process_peak = defaultdict(float)
@@ -784,13 +818,19 @@ class PowerDiary:
         return self.energy_saver_status
 
     def append_csv(self, path: Path, header: list[str], row: list) -> None:
+        self.append_csv_rows(path, header, [row])
+
+    def append_csv_rows(self, path: Path, header: list[str], rows: list[list]) -> None:
+        if not rows:
+            return
         try:
+            rotate_file(path, MAX_DIARY_BYTES)
             needs_header = not path.exists()
             with path.open("a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if needs_header:
                     writer.writerow(header)
-                writer.writerow(row)
+                writer.writerows(rows)
         except Exception as exc:
             log(f"Power diary write failed: {exc}")
 
@@ -904,15 +944,19 @@ class PowerDiary:
             ],
         )
 
+        process_rows = []
         for item in top_activity:
             cpu_guess_w = ""
             if system_watts:
                 cpu_guess_w = f"{system_watts * min(item['cpu_percent'], 100.0) / 100.0:.2f}"
-            self.append_csv(
-                self.process_path,
-                ["timestamp", "pid", "name", "cpu_percent", "cpu_weighted_w_guess"],
-                [timestamp, item["pid"], item["name"], f"{item['cpu_percent']:.2f}", cpu_guess_w],
+            process_rows.append(
+                [timestamp, item["pid"], item["name"], f"{item['cpu_percent']:.2f}", cpu_guess_w]
             )
+        self.append_csv_rows(
+            self.process_path,
+            ["timestamp", "pid", "name", "cpu_percent", "cpu_weighted_w_guess"],
+            process_rows,
+        )
 
         if self.process_score and (
             self.last_summary_time == 0.0 or now - self.last_summary_time >= POWER_DIARY_SUMMARY_INTERVAL
@@ -962,7 +1006,7 @@ class PowerDiary:
 class SurfaceBatteryWidget:
     def __init__(self) -> None:
         cleanup_old_startup()
-        enable_startup()
+        initialize_startup()
         self.power = PdhPowerMeter()
         self.battery = BatteryReader()
         self.tick = 0
@@ -978,7 +1022,6 @@ class SurfaceBatteryWidget:
         self.last_watts = None
         self.last_charging = False
         self.relock_until = 0.0
-        self.relock_reason = ""
         self.last_update_wall = time.time()
         self.running = False
         self.last_menu_time = 0.0
@@ -1055,7 +1098,7 @@ class SurfaceBatteryWidget:
     def lock_position(self) -> None:
         monitor = win32api.MonitorFromWindow(self.hwnd, win32con.MONITOR_DEFAULTTONEAREST)
         work = win32api.GetMonitorInfo(monitor)["Work"]
-        left, top, right, bottom = work
+        _, top, right, bottom = work
         x = right - self.width - self.px(RIGHT_MARGIN)
         y = bottom - self.height - self.px(BOTTOM_MARGIN)
         if y < top + self.px(24):
@@ -1075,7 +1118,6 @@ class SurfaceBatteryWidget:
         if self.allow_drag:
             return
         self.relock_until = max(self.relock_until, time.monotonic() + duration)
-        self.relock_reason = reason
         log(f"Relock requested: {reason}")
         self.refresh_dpi()
         self.lock_position()
@@ -1223,10 +1265,7 @@ class SurfaceBatteryWidget:
                 pass
         log(f"Context menu command: {command}")
         if command == MENU_TOGGLE_STARTUP:
-            if startup_enabled():
-                disable_startup()
-            else:
-                enable_startup()
+            set_startup_enabled(not startup_enabled())
         elif command == MENU_TOGGLE_DRAG:
             self.allow_drag = not self.allow_drag
             if not self.allow_drag:
@@ -1245,10 +1284,6 @@ class SurfaceBatteryWidget:
     def close(self) -> None:
         self.running = False
         try:
-            user32.KillTimer(self.hwnd, TIMER_ID)
-        except Exception:
-            pass
-        try:
             self.power.close()
         except Exception:
             pass
@@ -1260,7 +1295,7 @@ class SurfaceBatteryWidget:
         log("Widget closed")
 
     def wnd_proc(self, hwnd, msg, wparam, lparam):
-        if msg == WM_APP_UPDATE or (msg == win32con.WM_TIMER and wparam == TIMER_ID):
+        if msg == WM_APP_UPDATE:
             self.update_data()
             return 0
         if msg == win32con.WM_NCHITTEST:
@@ -1285,9 +1320,6 @@ class SurfaceBatteryWidget:
         if msg == WM_POWERBROADCAST:
             if wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE):
                 self.request_relock(f"power broadcast {wparam}", RESUME_RELOCK_SECONDS)
-            return 0
-        if msg == win32con.WM_SETTINGCHANGE:
-            self.lock_position()
             return 0
         if msg == win32con.WM_DESTROY:
             self.close()

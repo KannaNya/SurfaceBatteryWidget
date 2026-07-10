@@ -4,16 +4,17 @@ A lightweight Windows 11 battery-runtime overlay developed on a Surface Pro 8.
 The backend reads live system power draw and remaining battery energy, then
 estimates the time left on battery.
 
-The current V10 UI is a functional reference implementation, not a finished
-visual design. The next task is to redesign the frontend while preserving the
-working sensor, refresh, startup, positioning, and context-menu behavior.
+The V10 UI is a compact, DPI-aware Win11 taskbar companion using Segoe UI
+Variable and a theme-aware native layered window.
 
 ## Current behavior
 
 - Reads system power from the Windows PDH `Power Meter` counter.
 - Reads remaining battery capacity and AC state through WMI.
-- Recalculates the ETA once per second on a background worker.
+- Recalculates the ETA once per second while keeping sensor work on the window
+  thread and using a lightweight wake-up worker.
 - Uses a native Win32 per-pixel-alpha layered window.
+- Matches the Win11 taskbar font metrics and dark/light system theme.
 - Supports per-monitor DPI scaling, always-on-top display, drag locking,
   right-edge positioning, a right-click menu, and per-user startup.
 - Re-locks itself for several seconds after resume, display changes, DPI
@@ -23,6 +24,8 @@ working sensor, refresh, startup, positioning, and context-menu behavior.
 - The right-click menu can open the power summary, open the diary folder, and
   inspect local diagnostics.
 - Prevents duplicate instances with a named mutex.
+- Uses one persistent startup path and remembers an explicit startup opt-out.
+- Rotates runtime logs and diary CSV files to prevent unbounded disk growth.
 
 ## Requirements
 
@@ -59,7 +62,7 @@ is on and off. It needs samples from both states to be meaningful.
 
 ## Files
 
-- `SurfaceBatteryWidgetV10.py`: current backend and native reference UI.
+- `SurfaceBatteryWidgetV10.py`: current backend and native Win11 UI.
 - `Start_SurfaceBatteryWidgetV10.cmd`: portable Windows launcher.
 - `AnalyzeEnergySaver.py`: summarizes Energy Saver on/off power samples.
 - `GEMINI_FRONTEND_BRIEF.md`: frontend redesign brief and invariants.
