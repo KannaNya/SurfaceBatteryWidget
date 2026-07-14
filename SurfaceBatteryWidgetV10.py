@@ -1,5 +1,6 @@
 import ctypes
 import csv
+import math
 import os
 import sys
 import threading
@@ -273,8 +274,8 @@ def valid_battery_watts(value) -> float | None:
 
 class BatteryReader:
     def __init__(self) -> None:
-        self.wmi_default = win32com.client.GetObject("winmgmts:")
-        self.wmi_battery = win32com.client.GetObject(r"winmgmts:\\.\root\wmi")
+        self.wmi_default = None
+        self.wmi_battery = None
         self.snapshot = {
             "percent": None,
             "remaining_wh": None,
@@ -283,9 +284,23 @@ class BatteryReader:
             "charge_rate_w": None,
             "full_charge_wh": None,
         }
+        self._connect()
+
+    def _connect(self) -> None:
+        try:
+            self.wmi_default = win32com.client.GetObject("winmgmts:")
+            self.wmi_battery = win32com.client.GetObject(r"winmgmts:\\.\root\wmi")
+        except Exception as exc:
+            self.wmi_default = None
+            self.wmi_battery = None
+            log(f"WMI battery connection failed: {exc}")
 
     def refresh(self) -> dict:
         try:
+            if self.wmi_default is None or self.wmi_battery is None:
+                self._connect()
+            if self.wmi_default is None or self.wmi_battery is None:
+                return self.snapshot
             battery = list(self.wmi_default.InstancesOf("Win32_Battery"))
             statuses = list(self.wmi_battery.InstancesOf("BatteryStatus"))
             full = list(self.wmi_battery.InstancesOf("BatteryFullChargedCapacity"))
@@ -304,17 +319,31 @@ class BatteryReader:
                 ),
             }
         except Exception as exc:
+            self.wmi_default = None
+            self.wmi_battery = None
             log(f"WMI battery read failed: {exc}")
         return self.snapshot
 
 
 class ThermalReader:
     def __init__(self) -> None:
-        self.wmi = win32com.client.GetObject("winmgmts:")
+        self.wmi = None
         self.temperature_c: float | None = None
+        self._connect()
+
+    def _connect(self) -> None:
+        try:
+            self.wmi = win32com.client.GetObject("winmgmts:")
+        except Exception as exc:
+            self.wmi = None
+            log(f"WMI thermal connection failed: {exc}")
 
     def refresh(self) -> float | None:
         try:
+            if self.wmi is None:
+                self._connect()
+            if self.wmi is None:
+                return self.temperature_c
             rows = self.wmi.ExecQuery(
                 "SELECT Temperature,HighPrecisionTemperature "
                 "FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation"
@@ -329,6 +358,7 @@ class ThermalReader:
             if temperatures:
                 self.temperature_c = max(temperatures)
         except Exception as exc:
+            self.wmi = None
             log(f"Thermal-zone read failed: {exc}")
         return self.temperature_c
 
@@ -498,11 +528,26 @@ def format_eta(hours: float | None) -> str:
 
 
 def format_charge_eta(remaining_wh: float | None, full_charge_wh: float | None, charge_rate_w: float | None) -> str:
-    if not remaining_wh or not full_charge_wh or not charge_rate_w or charge_rate_w <= 0:
+    if remaining_wh is None or full_charge_wh is None:
+        return "AC"
+    try:
+        remaining_wh = float(remaining_wh)
+        full_charge_wh = float(full_charge_wh)
+    except (TypeError, ValueError):
+        return "AC"
+    if not math.isfinite(remaining_wh) or not math.isfinite(full_charge_wh) or full_charge_wh <= 0:
         return "AC"
     needed_wh = max(0.0, full_charge_wh - remaining_wh)
     if needed_wh <= 0.15:
         return "FULL"
+    if charge_rate_w is None:
+        return "AC"
+    try:
+        charge_rate_w = float(charge_rate_w)
+    except (TypeError, ValueError):
+        return "AC"
+    if not math.isfinite(charge_rate_w) or charge_rate_w <= 0:
+        return "AC"
     return format_eta(needed_wh / charge_rate_w)
 
 
@@ -1110,7 +1155,7 @@ class SurfaceBatteryWidget:
         )
         self.refresh_dpi()
         self.lock_position()
-        self.update_data()
+        self.safe_update_data()
         win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNOACTIVATE)
         self.running = True
         self.start_update_worker()
@@ -1119,6 +1164,12 @@ class SurfaceBatteryWidget:
     def start_update_worker(self) -> None:
         thread = threading.Thread(target=self.update_worker, name="SurfaceBatteryWidgetV10Update", daemon=True)
         thread.start()
+
+    def safe_update_data(self) -> None:
+        try:
+            self.update_data()
+        except Exception as exc:
+            log(f"Update cycle failed: {exc!r}")
 
     def update_worker(self) -> None:
         while self.running:
@@ -1197,9 +1248,9 @@ class SurfaceBatteryWidget:
         system_watts = mw / 1000.0 if mw else None
         watts = system_watts
         remaining = snap.get("remaining_wh")
-        charging = False
-        if snap.get("online"):
-            charging = True
+        on_ac = bool(snap.get("online"))
+        is_charging = bool(snap.get("charging"))
+        if on_ac:
             eta = format_charge_eta(
                 snap.get("remaining_wh"),
                 snap.get("full_charge_wh"),
@@ -1214,17 +1265,20 @@ class SurfaceBatteryWidget:
         self.last_eta = eta
         self.last_watts = watts
         self.last_temperature_c = temperature_c
-        self.last_charging = charging
+        self.last_charging = on_ac
         self.render()
         self.maybe_relock()
         try:
-            self.diary.sample(snap, eta, system_watts, watts, charging)
+            self.diary.sample(snap, eta, system_watts, watts, is_charging)
         except Exception as exc:
             log(f"Power diary sample failed: {exc}")
         if self.tick <= 5 or self.tick % 30 == 0:
             watts_text = "--" if watts is None else f"{watts:.1f}W"
             temperature_text = "--" if temperature_c is None else f"{temperature_c:.1f}C"
-            log(f"Tick {self.tick}: eta={eta}, temp={temperature_text}, watts={watts_text}")
+            log(
+                f"Tick {self.tick}: eta={eta}, temp={temperature_text}, watts={watts_text}, "
+                f"ac={on_ac}, charging={is_charging}"
+            )
 
     def render(self) -> None:
         watts_text = "--" if self.last_watts is None else f"{self.last_watts:.1f}W"
@@ -1359,12 +1413,15 @@ class SurfaceBatteryWidget:
 
     def wnd_proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_APP_UPDATE:
-            self.update_data()
+            self.safe_update_data()
             return 0
         if msg == win32con.WM_NCHITTEST:
             return win32con.HTCLIENT
         if msg in (win32con.WM_CONTEXTMENU, win32con.WM_RBUTTONDOWN, win32con.WM_RBUTTONUP):
-            self.show_context_menu()
+            try:
+                self.show_context_menu()
+            except Exception as exc:
+                log(f"Context menu failed: {exc!r}")
             return 0
         if msg == win32con.WM_LBUTTONDOWN:
             if self.allow_drag:
